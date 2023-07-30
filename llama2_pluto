@@ -1,0 +1,287 @@
+### A Pluto.jl notebook ###
+# v0.19.27
+
+using Markdown
+using InteractiveUtils
+
+# ╔═╡ 812a649c-2e08-11ee-3fc1-6b534fc3b822
+begin
+	using Pkg
+	Pkg.activate()
+	using DataFrames, Plots, PlutoUI
+end
+
+# ╔═╡ 6b7f4e50-9180-46bf-8dcc-67804eccba67
+include("/Users/bangboom/Documents/GitHub/Llama2.jl/llama2.jl")
+
+# ╔═╡ b689a853-a924-41ba-a55f-86849f2006b9
+
+
+# ╔═╡ 40dd698f-b5a4-4f4a-9fbc-21ec2cc435c7
+plotly()
+
+# ╔═╡ 2680c250-4f3d-4ea9-8166-825617f679bd
+main(
+	"/Users/bangboom/Documents/GitHub/Llama2.jl/stories15M.bin",
+	"/Users/bangboom/Documents/GitHub/Llama2.jl/tokenizer.bin";
+	temperature=0.0f0,
+	prompt="I have a dream that"
+)
+
+# ╔═╡ 859c68e9-b7b0-4cf1-9c7a-2d2b366c8196
+md"## Prompt输入之后发生了什么？"
+
+# ╔═╡ 4587d7f1-2e2a-4e0c-8354-2b57bbf568aa
+md"基于UTF8编码,每个字符会编码成UTF8的形式, 英文则是每个字母对应一个编码, 中文一般一个字对应3个"
+
+# ╔═╡ db0f925d-519e-4076-9605-c34533bb0ddb
+Dict(
+	[
+		("dream", Vector{UInt8}("dream"));
+		("梦", Vector{UInt8}("梦"))
+	]
+)
+
+# ╔═╡ 4885bb6c-3641-4108-b760-46b19065bbc9
+md"
+Prompt 输入之后就会按照UTF-8切分成多部分，然后基于预先设定的词表和每个词的概率来重新组合成token
+
+一般会用贪心的形式去把单个UInt8去拼凑起来，凑成一对如果能在词表里面找到就合并，一直迭代到没有可以合并的token为止
+"
+
+# ╔═╡ 95a482af-00bd-427c-97ab-a3a2d03f258b
+begin
+	tokenizer_filename = "/Users/bangboom/Documents/GitHub/Llama2.jl/tokenizer.bin"
+	vocab_size = 32000
+	vocab = Vector{Vector{UInt8}}(undef, vocab_size)
+	vocab_scores = Vector{Float32}(undef, vocab_size)
+	max_token_length = 1
+	
+	open(tokenizer_filename) do file
+		max_token_length = read(file, Int32)
+		for i in 1:vocab_size
+			vocab_scores[i] = read(file, Float32)
+			len = read(file, Int32)
+			vocab[i] = read(file, len)
+		end
+	end
+end
+
+# ╔═╡ 3285f17e-541e-43bf-b7db-dd9dd1790333
+begin
+	function str_lookup(str::Vector{UInt8}, vocab::Vector{Vector{UInt8}}, vocab_size::Int)::Int
+    for i in 1:vocab_size
+        if str == vocab[i]
+            return i
+        end
+    end
+    return -1
+end
+
+function bpe_encode(text::String, vocab::Vector{Vector{UInt8}}, vocab_scores::Vector{Float32}, vocab_size::Int, tokens::Vector{Int})
+    n_tokens = 0
+    for c in text
+        str_buffer = Vector{UInt8}(string(c))
+        id = str_lookup(str_buffer, vocab, vocab_size)
+        if id == -1
+            println("not good")
+            exit(1)
+        end
+        n_tokens += 1
+        tokens[n_tokens] = id
+    end
+
+    # @show tokens[1:n_tokens]
+    for i in 1:n_tokens
+        print("'"*String(copy(vocab[tokens[i]]))*"'", ' ')
+    end
+    println()
+
+    while true
+        best_score = -1e10
+        best_id = -1
+        best_idx = -1
+
+        for i in 1:n_tokens-1
+            # check if we can merge the pair (tokens[i], tokens[i+1])
+            str_buffer = [vocab[tokens[i]]; vocab[tokens[i+1]]]
+            id = str_lookup(str_buffer, vocab, vocab_size)
+            if id != -1 && vocab_scores[id] > best_score
+                best_score = vocab_scores[id]
+                best_id = id
+                best_idx = i
+            end
+        end
+
+        best_idx == -1 && break # we couldn't find any more pairs to merge, so we're done
+
+        # merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        tokens[best_idx] = best_id
+        # delete token at position best_idx+1, shift the entire sequence back 1
+        for i in best_idx+1:n_tokens-1
+            tokens[i] = tokens[i+1]
+        end
+        n_tokens -= 1
+        # @show tokens[1:n_tokens]
+        for i in 1:n_tokens
+            print("'"*String(copy(vocab[tokens[i]]))*"'", ' ')
+        end
+        println()
+    end
+	@show tokens[1:n_tokens]
+
+    return n_tokens
+end
+end
+
+# ╔═╡ 0238146b-7b67-4c32-b32f-dcda0ab596da
+bpe_encode(
+	"I have a dream",
+	vocab,
+	vocab_scores,
+	32000,
+	zeros(Int, 256)
+)
+
+# ╔═╡ 5157747f-f811-488d-b7a9-41c2fc296c44
+vocab[506],Vector{UInt8}("have")
+
+# ╔═╡ 157631bc-b945-43ba-86da-866b52b42982
+md"当输入I have a dream 作为PROMPT的时候实际传入模型的是下面的矩阵"
+
+# ╔═╡ 647dc879-1f1e-4fd3-a82e-2a532f508da0
+bpe_encode(
+	"man boy women girl",
+	vocab,
+	vocab_scores,
+	32000,
+	zeros(Int, 256)
+)
+
+# ╔═╡ 353a2fbb-8019-4bec-847c-a5bbeb0a2f4b
+begin
+	config = nothing
+	weights = nothing
+	checkpoint_filename = "/Users/bangboom/Documents/GitHub/Llama2.jl/stories15M.bin"
+	# read in the model.bin file
+	open(checkpoint_filename) do file
+		config = read_config(file)
+		weights = TransformerWeights(config)
+		checkpoint_init_weights!(weights, file)
+	end
+end
+
+# ╔═╡ 13d2f187-7926-4392-8f8f-eeb92f351332
+weights.token_embedding_table[:, [77, 506, 264, 12562]]
+
+# ╔═╡ 90007225-f24e-4fa8-8dcf-f41e2ed3592c
+md"### Embedding的含义" 
+
+# ╔═╡ b1290fa6-6d31-48ba-985d-35f11b21d392
+weights.token_embedding_table[:,[1172, 8024, 5867, 7827, 26936, 23430, 27275]]
+
+# ╔═╡ 165070bd-7365-4518-9431-9ad64852311f
+md"做矩阵乘法计算两个向量之间的相似度"
+
+# ╔═╡ 4c868ff6-76f8-4b2c-ae2a-0c19d29dba55
+heatmap(
+	["man", "boy", "women", "girl", "coffee", "tea", "milk"],
+	["man", "boy", "women", "girl", "coffee", "tea", "milk"],
+	transpose(weights.token_embedding_table[:,[1172, 8024, 5867, 7827, 26936, 23430, 27275]]) * weights.token_embedding_table[:,[1172, 8024, 5867, 7827, 26936, 23430, 27275]],
+	c=cgrad([:blue, :white,:red, :yellow]),
+)
+
+# ╔═╡ 60b40004-a908-432b-aa5f-c186cf46bd4a
+md"## Attention 机制在做什么
+
+一个不准确但直观的理解： 抛开位置编码，以及layerNorm, 和全联接
+
+假设输入是 I have a 要预测 dream
+
+Attention机制下期望的则是： 
+
+$s_1 * embedding(I) + s_2 * embedding(have) + s_3 * embedding(a) = embedding'$
+
+$s_1 = transpose(embedding(I)) * embedding(a)$
+$s_2 = transpose(embedding(have)) * embedding(a)$
+$s_3 = transpose(embedding(a)) * embedding(a)$
+
+$softmax([s_1, s_2, s_3])$
+
+$s_1 + s_2 + s_3 = 1$
+
+
+通过将$embedding'$与整个embedding矩阵相乘则可以得到一个长度为32000（词表的长度）的向量， 基于向量每一位的权重去做采样，就能得到下一个token， 也是为什么每次ChatGPT生成的内容是不同的原理
+
+### 为什么需要位置编码
+
+transformer中的参数都是针对每一个embedding去运算的， 只有attention模块是去基于权重合并每个token的embedding， 因此单词的先后顺序在模型中是不感知的， 上面的情况把 I have a顺序随便调换结果并不会改变。
+
+### 什么是Q K V
+
+在$s_1, s_2, s_3$ 中的$embedding(a)$是 $q$
+
+另外对应的$transpose(embedding(I))$是 $k$
+
+与$s_1, s_2, s_3$相乘的$embedding(I), embedding(have), embedding(a)$ 是 $v$
+
+实际上Q, K, V是一样的（不考虑Q, K, V做了一层线性映射的情况下）
+
+### 什么是Multi-Head
+
+Multi-Head的作用是把embedding从原始的维度N，映射成了h个小的维度M， $N = h*M$
+"
+
+# ╔═╡ 146ce80f-105c-46b4-a0c4-ab9a425e0e2e
+
+
+# ╔═╡ 4bc2996b-40e8-4622-823c-8bca2b41f596
+md"## step by step
+
+逐步执行Llama中的一层
+"
+
+# ╔═╡ d251175e-2543-4937-a449-52712396b45d
+[
+	("<s>", weights.token_embedding_table[:, 1]),
+	("I", weights.token_embedding_table[:, 77]),
+	("have", weights.token_embedding_table[:, 506]),
+	("a", weights.token_embedding_table[:, 264]),
+	("dream", weights.token_embedding_table[:, 12562]),
+	("that", weights.token_embedding_table[:, 394])
+]
+
+# ╔═╡ 45304830-0cfa-444d-9141-449c00e3c76b
+input_matrix = weights.token_embedding_table[:, [1, 77, 506, 264, 12562, 394]]
+
+# ╔═╡ 2437b364-0cdc-4836-aaa7-c570855fd8d7
+
+
+# ╔═╡ Cell order:
+# ╠═812a649c-2e08-11ee-3fc1-6b534fc3b822
+# ╠═b689a853-a924-41ba-a55f-86849f2006b9
+# ╠═40dd698f-b5a4-4f4a-9fbc-21ec2cc435c7
+# ╠═6b7f4e50-9180-46bf-8dcc-67804eccba67
+# ╠═2680c250-4f3d-4ea9-8166-825617f679bd
+# ╟─859c68e9-b7b0-4cf1-9c7a-2d2b366c8196
+# ╠═4587d7f1-2e2a-4e0c-8354-2b57bbf568aa
+# ╟─db0f925d-519e-4076-9605-c34533bb0ddb
+# ╟─4885bb6c-3641-4108-b760-46b19065bbc9
+# ╟─95a482af-00bd-427c-97ab-a3a2d03f258b
+# ╟─3285f17e-541e-43bf-b7db-dd9dd1790333
+# ╠═0238146b-7b67-4c32-b32f-dcda0ab596da
+# ╠═5157747f-f811-488d-b7a9-41c2fc296c44
+# ╟─157631bc-b945-43ba-86da-866b52b42982
+# ╠═13d2f187-7926-4392-8f8f-eeb92f351332
+# ╠═647dc879-1f1e-4fd3-a82e-2a532f508da0
+# ╟─353a2fbb-8019-4bec-847c-a5bbeb0a2f4b
+# ╟─90007225-f24e-4fa8-8dcf-f41e2ed3592c
+# ╠═b1290fa6-6d31-48ba-985d-35f11b21d392
+# ╟─165070bd-7365-4518-9431-9ad64852311f
+# ╟─4c868ff6-76f8-4b2c-ae2a-0c19d29dba55
+# ╟─d251175e-2543-4937-a449-52712396b45d
+# ╟─60b40004-a908-432b-aa5f-c186cf46bd4a
+# ╠═146ce80f-105c-46b4-a0c4-ab9a425e0e2e
+# ╟─4bc2996b-40e8-4622-823c-8bca2b41f596
+# ╠═45304830-0cfa-444d-9141-449c00e3c76b
+# ╠═2437b364-0cdc-4836-aaa7-c570855fd8d7
