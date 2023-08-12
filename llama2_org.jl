@@ -6,7 +6,6 @@ using StatsBase
 using Printf
 
 # Transformer and RunState structs, and related memory management
-
 mutable struct Config
     dim::Int        # transformer dimension
     hidden_dim::Int # for ffn layers
@@ -68,35 +67,24 @@ TransformerWeights(p::Config) = TransformerWeights(;
     wcls=zeros(Float32, p.dim, p.vocab_size)
 )
 
-function checkpoint_init_weights!(w::TransformerWeights, f::IOStream, shared_weights::Bool)
+function checkpoint_init_weights!(w::TransformerWeights, f::IOStream, share_weights::Bool)
     read!(f, w.token_embedding_table)
-    println("loaded token_embedding_table..")
     read!(f, w.rms_att_weight)
-    println("loaded rms_att_weight")
     read!(f, w.wq)
-    println("loaded wq")
+    @show w.wq[1:10]
     read!(f, w.wk)
-    println("loaded wk")
     read!(f, w.wv)
-    println("loaded wv")
     read!(f, w.wo)
-    println("loaded wo")
     read!(f, w.rms_ffn_weight)
-    println("loaded rms")
     read!(f, w.w1)
-    println("loaded w1")
     read!(f, w.w2)
-    println("loaded w2")
     read!(f, w.w3)
-    println("loaded w3")
     read!(f, w.rms_final_weight)
     read!(f, w.freq_cis_real)
     read!(f, w.freq_cis_imag)
-    shared_weights ? copyto!(w.wcls, w.token_embedding_table) : read!(f, w.wcls)
-    println("loaded wcls")
-    @show w.wcls[1]
-    @show w.token_embedding_table[1]
-    exit(1)
+    @show share_weights
+    share_weights ? copyto!(w.wcls, w.token_embedding_table) : read!(f, w.wcls)
+    @show w.wcls[1:10]
     return nothing
 end
 
@@ -162,6 +150,9 @@ end
 
     # copy the token embedding into x
     copyto!(x, w.token_embedding_table[:, token])
+    # @show x[1:10]
+    # @show size(x)
+    # exit(1)
 
     # pluck out the "pos" row of freq_cis_real and freq_cis_imag
     freq_cis_real_row = w.freq_cis_real[:, pos]
@@ -256,13 +247,15 @@ end
 
     # final rmsnorm
     rmsnorm!(x, x, w.rms_final_weight)
-    # @show x
-    # exit(0)
+
     # classifier into logits
     mul!(s.logits, w.wcls', x)
 
     return nothing
 end
+
+# ----------------------------------------------------------------------------
+# byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
 function str_lookup(str::Vector{UInt8}, vocab::Vector{Vector{UInt8}}, vocab_size::Int)::Int
     for i in 1:vocab_size
@@ -316,89 +309,99 @@ function bpe_encode(text::String, vocab::Vector{Vector{UInt8}}, vocab_scores::Ve
     return n_tokens
 end
 
+
+
+
 function main(
     checkpoint_filename::AbstractString,
     tokenizer_filename::AbstractString;
     temperature::Float32=0.9f0,
-    prompt::AbstractString=""
+    prompt::String="",
+    steps::Int=256
 )
 
     config = nothing
     weights = nothing
+
     # read in the model.bin file
     open(checkpoint_filename) do file
         config = read_config(file)
-        shared_weights = config.vocab_size > 0
+        share_weights = config.vocab_size > 0
         config.vocab_size = abs(config.vocab_size)
-        # weights = TransformerWeights(config)
-        # checkpoint_init_weights!(weights, file, shared_weights)
+        weights = TransformerWeights(config)
+        checkpoint_init_weights!(weights, file, share_weights)
+        @show "loaded"
+        # token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+        # skip(file, sizeof(token_embedding_table))
+        # rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+        # skip(file, sizeof(rms_att_weight))
 
-        token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-        skip(file, sizeof(token_embedding_table))
-        rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        skip(file, sizeof(rms_att_weight))
-        rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        skip(file, sizeof(rms_ffn_weight))
-
-        wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wq))
+        # wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        # skip(file, sizeof(wq))
         
-        wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wk))
+        # wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        # skip(file, sizeof(wk))
 
-        wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wv))
+        # wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        # skip(file, sizeof(wv))
 
-        wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wo))
+        # wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        # skip(file, sizeof(wo))
 
-        w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        skip(file, sizeof(w1))
+        # rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+        # skip(file, sizeof(rms_ffn_weight))
 
-        w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
-        skip(file, sizeof(w2))
+        # w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+        # skip(file, sizeof(w1))
 
-        w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        skip(file, sizeof(w3))
+        # w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
+        # skip(file, sizeof(w2))
 
-        println("loaded w")
-        rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
-        skip(file, sizeof(rms_final_weight))
+        # w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+        # skip(file, sizeof(w3))
 
-        freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        skip(file, sizeof(freq_cis_real))
-        freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        skip(file, sizeof(freq_cis_imag))
+        # rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
+        # skip(file, sizeof(rms_final_weight))
 
-        if shared_weights
-            wcls = token_embedding_table
-        else
-            wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-        end
-        println("loaded all weights")
+        # freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+        # skip(file, sizeof(freq_cis_real))
+        # freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+        # skip(file, sizeof(freq_cis_imag))
 
-        weights = TransformerWeights(;
-            token_embedding_table=token_embedding_table,
-            rms_att_weight=rms_att_weight,
-            rms_ffn_weight=rms_ffn_weight,
-            wq=wq,
-            wk=wk,
-            wv=wv,
-            wo=wo,
-            w1=w1,
-            w2=w2,
-            w3=w3,
-            rms_final_weight=rms_final_weight,
-            freq_cis_real=freq_cis_real,
-            freq_cis_imag=freq_cis_imag,
-            wcls=wcls
-        )
+        # if share_weights
+        #     wcls = token_embedding_table
+        # else
+        #     wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+        #     skip(file, sizeof(wcls))
+        # end
+
+        # @show rms_ffn_weight[1:10]
+        # @show wq[1:10]
+        # @show wcls[1:10]
+
+        # eof(file) || throw(EOFError())
+        # weights = TransformerWeights(;
+        #     token_embedding_table=token_embedding_table,
+        #     rms_att_weight=rms_att_weight,
+        #     rms_ffn_weight=rms_ffn_weight,
+        #     rms_final_weight=rms_final_weight,
+        #     wq=wq,
+        #     wk=wk,
+        #     wv=wv,
+        #     wo=wo,
+        #     w1=w1,
+        #     w2=w2,
+        #     w3=w3,
+        #     freq_cis_real=freq_cis_real,
+        #     freq_cis_imag=freq_cis_imag,
+        #     wcls=wcls
+        # )
     end
 
     # read in the tokenizer.bin file
     vocab = Vector{Vector{UInt8}}(undef, config.vocab_size)
     vocab_scores = Vector{Float32}(undef, config.vocab_size)
-    max_token_length = 1
+    max_token_length::Int = 1
 
     open(tokenizer_filename) do file
         max_token_length = read(file, Int32)
@@ -408,6 +411,7 @@ function main(
             vocab[i] = read(file, len)
         end
     end
+
 
     # create and init the application RunState
     state = RunState(config)
@@ -421,13 +425,10 @@ function main(
     # the current position we are in
     time_start = time_ns()
 
-    token = 1 # 1 = BOS token in Llama-2 sentencepiece
-
-    for pos in 1:config.seq_len
+    token = 2 # 1 = BOS token in Llama-2 sentencepiece
+    for pos in 1:min(steps, config.seq_len)
         # forward the transformer to get logits for the next token
         transformer!(token, pos, config, state, weights)
-
-        # sample the next token
         if pos <= num_prompt_tokens
             next = prompt_tokens[pos]
         else
@@ -444,9 +445,8 @@ function main(
                 next = wsample(1:config.vocab_size, state.logits)
             end
         end
-
+        next == 2 && break
         print(String(copy(vocab[next])))
-
         # advance forward
         token = next
     end
@@ -460,8 +460,7 @@ function main(
 end
 
 main(
-    "../llama2.c/stories15M.bin",
-    "tokenizer.bin";
-    temperature=0.f0,
-    prompt="I have a dream that"
+    "../llama2.c/llama2_7b.bin", "tokenizer.bin"; 
+    temperature=0.0f0,
+    prompt="I want to"
 )
