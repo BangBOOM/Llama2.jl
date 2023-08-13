@@ -4,6 +4,11 @@ using Mmap
 using LinearAlgebra
 using StatsBase
 using Printf
+using TimerOutputs
+BLAS.set_num_threads(8)
+
+const to = TimerOutput()
+
 
 # Transformer and RunState structs, and related memory management
 mutable struct Config
@@ -161,88 +166,96 @@ end
     # forward all the layers
     for l in 1:p.n_layers
         # attention rmsnorm
-        rmsnorm!(s.xb, x, w.rms_att_weight[:, l])
+        @timeit to "layer" begin
+            rmsnorm!(s.xb, x, w.rms_att_weight[:, l])
 
-        # qkv matmuls for this position
-        mul!(s.q, w.wq[:, :, l]', s.xb)
-        mul!(s.k, w.wk[:, :, l]', s.xb)
-        mul!(s.v, w.wv[:, :, l]', s.xb)
-
-        # apply RoPE rotation to the q and k vectors for each head
-        for h in 1:p.n_heads
-            # get the q and k vectors for this head
-            q = s.q[((h-1)*head_size+1):(h*head_size)]
-            k = s.k[((h-1)*head_size+1):(h*head_size)]
-            # rotate q and k by the freq_cis_real and freq_cis_imag
-            for i in 1:(head_size÷2)
-                q0 = q[2*i-1]
-                q1 = q[2*i]
-                k0 = k[2*i-1]
-                k1 = k[2*i]
-                fcr = freq_cis_real_row[i]
-                fci = freq_cis_imag_row[i]
-                q[2*i-1] = q0 * fcr - q1 * fci
-                q[2*i] = q0 * fci + q1 * fcr
-                k[2*i-1] = k0 * fcr - k1 * fci
-                k[2*i] = k0 * fci + k1 * fcr
-            end
-        end
-
-        # save key,value at this time step (pos) to our kv cache
-        copyto!(s.key_cache[:, pos, l], s.k)
-        copyto!(s.value_cache[:, pos, l], s.v)
-
-        # multihead attention. iterate over all heads
-        for h in 1:p.n_heads
-            # get the query vector for this head
-            q = s.q[((h-1)*head_size+1):(h*head_size)]
-            # iterate over all timesteps, including the current one
-            for t in 1:pos
-                # get the key vector for this head and at this timestep
-                k = s.key_cache[((h-1)*head_size+1):(h*head_size), t, l]
-                # calculate the attention score as the dot product of q and k
-                score = dot(q, k) / sqrt(Float32(head_size))
-                # save the score to the attention buffer
-                s.att[t] = score
+            # qkv matmuls for this position
+            @timeit to "map qkv" begin
+                mul!(s.q, w.wq[:, :, l]', s.xb)
+                mul!(s.k, w.wk[:, :, l]', s.xb)
+                mul!(s.v, w.wv[:, :, l]', s.xb)
             end
 
-            # softmax the scores to get attention weights, from 0..pos inclusively
-            softmax!(s.att[1:pos])
 
-            # weighted sum of the values, store back into xb
-            mul!(
-                s.xb[((h-1)*head_size+1):(h*head_size)],
-                s.value_cache[((h-1)*head_size+1):(h*head_size), 1:pos, l],
-                s.att[1:pos],
-            )
+            # apply RoPE rotation to the q and k vectors for each head
+            @timeit to "RoPE" for h in 1:p.n_heads
+                # get the q and k vectors for this head
+                q = s.q[((h-1)*head_size+1):(h*head_size)]
+                k = s.k[((h-1)*head_size+1):(h*head_size)]
+                # rotate q and k by the freq_cis_real and freq_cis_imag
+                for i in 1:(head_size÷2)
+                    q0 = q[2*i-1]
+                    q1 = q[2*i]
+                    k0 = k[2*i-1]
+                    k1 = k[2*i]
+                    fcr = freq_cis_real_row[i]
+                    fci = freq_cis_imag_row[i]
+                    q[2*i-1] = q0 * fcr - q1 * fci
+                    q[2*i] = q0 * fci + q1 * fcr
+                    k[2*i-1] = k0 * fcr - k1 * fci
+                    k[2*i] = k0 * fci + k1 * fcr
+                end
+            end
+
+            # save key,value at this time step (pos) to our kv cache
+            copyto!(s.key_cache[:, pos, l], s.k)
+            copyto!(s.value_cache[:, pos, l], s.v)
+
+            # multihead attention. iterate over all heads
+            @timeit to "multihead Attention" for h in 1:p.n_heads
+                # get the query vector for this head
+                q = s.q[((h-1)*head_size+1):(h*head_size)]
+                # iterate over all timesteps, including the current one
+                for t in 1:pos
+                    # get the key vector for this head and at this timestep
+                    k = s.key_cache[((h-1)*head_size+1):(h*head_size), t, l]
+                    # calculate the attention score as the dot product of q and k
+                    score = dot(q, k) / sqrt(Float32(head_size))
+                    # save the score to the attention buffer
+                    s.att[t] = score
+                end
+
+                # softmax the scores to get attention weights, from 0..pos inclusively
+                softmax!(s.att[1:pos])
+
+                # weighted sum of the values, store back into xb
+                mul!(
+                    s.xb[((h-1)*head_size+1):(h*head_size)],
+                    s.value_cache[((h-1)*head_size+1):(h*head_size), 1:pos, l],
+                    s.att[1:pos],
+                )
+            end
+
+            # final matmul to get the output of the attention
+            @timeit to "mul att out" mul!(s.xb2, w.wo[:, :, l]', s.xb)
+
+            # residual connection back into x
+            x .+= s.xb2
+
+            # ffn rmsnorm
+            rmsnorm!(s.xb, x, w.rms_ffn_weight[:, l])
+
+            @timeit to "FFN" begin
+                # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+                # first calculate self.w1(x) and self.w3(x)
+                @timeit to "FFN1" mul!(s.hb, w.w1[:, :, l]', s.xb)
+                @timeit to "FFN3" mul!(s.hb2, w.w3[:, :, l]', s.xb)
+
+                # F.silu silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+                for i in 1:hidden_dim
+                    s.hb[i] = s.hb[i] * (1.0f0 / (1.0f0 + exp(-s.hb[i])))
+                end
+
+                s.hb .*= s.hb2
+
+                # final matmul to get the output of the ffn
+                @timeit to "FFN2" mul!(s.xb, w.w2[:, :, l]', s.hb)
+            end
+
+``
+            # residual connection
+            x .+= s.xb
         end
-
-        # final matmul to get the output of the attention
-        mul!(s.xb2, w.wo[:, :, l]', s.xb)
-
-        # residual connection back into x
-        x .+= s.xb2
-
-        # ffn rmsnorm
-        rmsnorm!(s.xb, x, w.rms_ffn_weight[:, l])
-
-        # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        # first calculate self.w1(x) and self.w3(x)
-        mul!(s.hb, w.w1[:, :, l]', s.xb)
-        mul!(s.hb2, w.w3[:, :, l]', s.xb)
-
-        # F.silu silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
-        for i in 1:hidden_dim
-            s.hb[i] = s.hb[i] * (1.0f0 / (1.0f0 + exp(-s.hb[i])))
-        end
-
-        s.hb .*= s.hb2
-
-        # final matmul to get the output of the ffn
-        mul!(s.xb, w.w2[:, :, l]', s.hb)
-
-        # residual connection
-        x .+= s.xb
     end
 
     # final rmsnorm
@@ -328,76 +341,81 @@ function main(
         config = read_config(file)
         share_weights = config.vocab_size > 0
         config.vocab_size = abs(config.vocab_size)
-        weights = TransformerWeights(config)
-        checkpoint_init_weights!(weights, file, share_weights)
+        # weights = TransformerWeights(config)
+        # checkpoint_init_weights!(weights, file, share_weights)
+        # @show "loaded"
+        token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+        skip(file, sizeof(token_embedding_table))
+        rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+        skip(file, sizeof(rms_att_weight))
+
+        wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        skip(file, sizeof(wq))
+
+        wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        skip(file, sizeof(wk))
+
+        wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        skip(file, sizeof(wv))
+
+        wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+        skip(file, sizeof(wo))
+
+        rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+        skip(file, sizeof(rms_ffn_weight))
+
+        w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+        skip(file, sizeof(w1))
+
+        w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
+        skip(file, sizeof(w2))
+
+        w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+        skip(file, sizeof(w3))
+
+        rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
+        skip(file, sizeof(rms_final_weight))
+
+        freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+        skip(file, sizeof(freq_cis_real))
+        freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+        skip(file, sizeof(freq_cis_imag))
+
+        if share_weights
+            wcls = token_embedding_table
+        else
+            wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+            skip(file, sizeof(wcls))
+        end
+
+        @show rms_ffn_weight[1:10]
+        @show wq[1:10]
+        @show wcls[1:10]
+        @show size(w1)
+        @show size(w2)
+        @show size(w3)
+
+        eof(file) || throw(EOFError())
+        weights = TransformerWeights(;
+            token_embedding_table=token_embedding_table,
+            rms_att_weight=rms_att_weight,
+            rms_ffn_weight=rms_ffn_weight,
+            rms_final_weight=rms_final_weight,
+            wq=wq,
+            wk=wk,
+            wv=wv,
+            wo=wo,
+            w1=w1,
+            w2=w2,
+            w3=w3,
+            freq_cis_real=freq_cis_real,
+            freq_cis_imag=freq_cis_imag,
+            wcls=wcls
+        )
         @show "loaded"
-        # token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-        # skip(file, sizeof(token_embedding_table))
-        # rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        # skip(file, sizeof(rms_att_weight))
-
-        # wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        # skip(file, sizeof(wq))
-        
-        # wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        # skip(file, sizeof(wk))
-
-        # wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        # skip(file, sizeof(wv))
-
-        # wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        # skip(file, sizeof(wo))
-
-        # rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        # skip(file, sizeof(rms_ffn_weight))
-
-        # w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        # skip(file, sizeof(w1))
-
-        # w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
-        # skip(file, sizeof(w2))
-
-        # w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        # skip(file, sizeof(w3))
-
-        # rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
-        # skip(file, sizeof(rms_final_weight))
-
-        # freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        # skip(file, sizeof(freq_cis_real))
-        # freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        # skip(file, sizeof(freq_cis_imag))
-
-        # if share_weights
-        #     wcls = token_embedding_table
-        # else
-        #     wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-        #     skip(file, sizeof(wcls))
-        # end
-
-        # @show rms_ffn_weight[1:10]
-        # @show wq[1:10]
-        # @show wcls[1:10]
-
-        # eof(file) || throw(EOFError())
-        # weights = TransformerWeights(;
-        #     token_embedding_table=token_embedding_table,
-        #     rms_att_weight=rms_att_weight,
-        #     rms_ffn_weight=rms_ffn_weight,
-        #     rms_final_weight=rms_final_weight,
-        #     wq=wq,
-        #     wk=wk,
-        #     wv=wv,
-        #     wo=wo,
-        #     w1=w1,
-        #     w2=w2,
-        #     w3=w3,
-        #     freq_cis_real=freq_cis_real,
-        #     freq_cis_imag=freq_cis_imag,
-        #     wcls=wcls
-        # )
     end
 
+    println(config)
     # read in the tokenizer.bin file
     vocab = Vector{Vector{UInt8}}(undef, config.vocab_size)
     vocab_scores = Vector{Float32}(undef, config.vocab_size)
@@ -426,6 +444,7 @@ function main(
     time_start = time_ns()
 
     token = 2 # 1 = BOS token in Llama-2 sentencepiece
+    token_cnt = 0
     for pos in 1:min(steps, config.seq_len)
         # forward the transformer to get logits for the next token
         transformer!(token, pos, config, state, weights)
@@ -446,6 +465,7 @@ function main(
             end
         end
         next == 2 && break
+        token_cnt += 1
         print(String(copy(vocab[next])))
         # advance forward
         token = next
@@ -454,13 +474,16 @@ function main(
 
     # report our achieved tok/s
     time_end = time_ns()
-    @printf "achieved tok/s: %f\n" config.seq_len / (time_end - time_start) * 1e9
+    @printf "achieved tok/s: %f\n" token_cnt / (time_end - time_start) * 1e9
 
     return nothing
 end
 
 main(
-    "../llama2.c/llama2_7b.bin", "tokenizer.bin"; 
+    "../llama2.c/llama2_7b.bin", "bin/tokenizer.bin";
     temperature=0.0f0,
-    prompt="I want to"
+    prompt="I want to",
+    steps=5
 )
+
+show(to)
