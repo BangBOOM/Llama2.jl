@@ -93,6 +93,72 @@ function checkpoint_init_weights!(w::TransformerWeights, f::IOStream, share_weig
     return nothing
 end
 
+function load_checkpoint_mmap(file::IOStream, config::Config, share_weights::Bool)
+    token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+    skip(file, sizeof(token_embedding_table))
+
+    rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+    skip(file, sizeof(rms_att_weight))
+
+    wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+    skip(file, sizeof(wq))
+
+    wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+    skip(file, sizeof(wk))
+
+    wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+    skip(file, sizeof(wv))
+
+    wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
+    skip(file, sizeof(wo))
+
+    rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
+    skip(file, sizeof(rms_ffn_weight))
+
+    w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+    skip(file, sizeof(w1))
+
+    w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
+    skip(file, sizeof(w2))
+
+    w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
+    skip(file, sizeof(w3))
+
+    rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
+    skip(file, sizeof(rms_final_weight))
+
+    freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+    skip(file, sizeof(freq_cis_real))
+    freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
+    skip(file, sizeof(freq_cis_imag))
+
+    if share_weights
+        wcls = token_embedding_table
+    else
+        wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
+        skip(file, sizeof(wcls))
+    end
+
+    eof(file) || throw(EOFError())
+    weights = TransformerWeights(;
+        token_embedding_table=token_embedding_table,
+        rms_att_weight=rms_att_weight,
+        rms_ffn_weight=rms_ffn_weight,
+        rms_final_weight=rms_final_weight,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wo=wo,
+        w1=w1,
+        w2=w2,
+        w3=w3,
+        freq_cis_real=freq_cis_real,
+        freq_cis_imag=freq_cis_imag,
+        wcls=wcls
+    )
+    return weights
+end
+
 @kwdef struct RunState
     # current wave of activations
     x::Vector{Float32}      # activation at current time stamp (dim,)
@@ -252,7 +318,6 @@ end
                 @timeit to "FFN2" mul!(s.xb, w.w2[:, :, l]', s.hb)
             end
 
-``
             # residual connection
             x .+= s.xb
         end
@@ -330,7 +395,8 @@ function main(
     tokenizer_filename::AbstractString;
     temperature::Float32=0.9f0,
     prompt::String="",
-    steps::Int=256
+    steps::Int=256,
+    use_mmap::Bool=true
 )
 
     config = nothing
@@ -341,85 +407,18 @@ function main(
         config = read_config(file)
         share_weights = config.vocab_size > 0
         config.vocab_size = abs(config.vocab_size)
-        # weights = TransformerWeights(config)
-        # checkpoint_init_weights!(weights, file, share_weights)
-        # @show "loaded"
-        token_embedding_table = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-        skip(file, sizeof(token_embedding_table))
-        rms_att_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        skip(file, sizeof(rms_att_weight))
-
-        wq = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wq))
-
-        wk = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wk))
-
-        wv = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wv))
-
-        wo = reshape(mmap(file, Matrix{Float32}, (config.dim * config.dim * config.n_layers, 1)), config.dim, config.dim, config.n_layers)
-        skip(file, sizeof(wo))
-
-        rms_ffn_weight = mmap(file, Matrix{Float32}, (config.dim, config.n_layers))
-        skip(file, sizeof(rms_ffn_weight))
-
-        w1 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        skip(file, sizeof(w1))
-
-        w2 = reshape(mmap(file, Matrix{Float32}, (config.hidden_dim * config.dim * config.n_layers, 1)), config.hidden_dim, config.dim, config.n_layers)
-        skip(file, sizeof(w2))
-
-        w3 = reshape(mmap(file, Matrix{Float32}, (config.dim * config.hidden_dim * config.n_layers, 1)), config.dim, config.hidden_dim, config.n_layers)
-        skip(file, sizeof(w3))
-
-        rms_final_weight = mmap(file, Vector{Float32}, (config.dim,))
-        skip(file, sizeof(rms_final_weight))
-
-        freq_cis_real = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        skip(file, sizeof(freq_cis_real))
-        freq_cis_imag = mmap(file, Matrix{Float32}, ((config.dim ÷ config.n_heads) ÷ 2, config.seq_len))
-        skip(file, sizeof(freq_cis_imag))
-
-        if share_weights
-            wcls = token_embedding_table
+        if use_mmap
+            weights = load_checkpoint_mmap(file, config, share_weights)
         else
-            wcls = mmap(file, Matrix{Float32}, (config.dim, config.vocab_size))
-            skip(file, sizeof(wcls))
+            weights = TransformerWeights(config)
+            checkpoint_init_weights!(weights, file, share_weights)
         end
-
-        @show rms_ffn_weight[1:10]
-        @show wq[1:10]
-        @show wcls[1:10]
-        @show size(w1)
-        @show size(w2)
-        @show size(w3)
-
-        eof(file) || throw(EOFError())
-        weights = TransformerWeights(;
-            token_embedding_table=token_embedding_table,
-            rms_att_weight=rms_att_weight,
-            rms_ffn_weight=rms_ffn_weight,
-            rms_final_weight=rms_final_weight,
-            wq=wq,
-            wk=wk,
-            wv=wv,
-            wo=wo,
-            w1=w1,
-            w2=w2,
-            w3=w3,
-            freq_cis_real=freq_cis_real,
-            freq_cis_imag=freq_cis_imag,
-            wcls=wcls
-        )
-        @show "loaded"
     end
 
-    println(config)
+    @show config
     # read in the tokenizer.bin file
     vocab = Vector{Vector{UInt8}}(undef, config.vocab_size)
     vocab_scores = Vector{Float32}(undef, config.vocab_size)
-    max_token_length::Int = 1
 
     open(tokenizer_filename) do file
         max_token_length = read(file, Int32)
@@ -480,10 +479,11 @@ function main(
 end
 
 main(
-    "../llama2.c/llama2_7b.bin", "bin/tokenizer.bin";
+    "bin/stories110M.bin", "bin/tokenizer.bin";
     temperature=0.0f0,
     prompt="I want to",
-    steps=5
+    steps=256,
+    use_mmap=true
 )
 
 show(to)
