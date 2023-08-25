@@ -5,13 +5,13 @@ using StatsBase
 
 struct Tokenizer
     id_to_token::Vector{String}
-    token_to_id::Dict{String, Int}
+    token_to_id::Dict{String,Int}
     token_scores::Vector{Float32}
 end
 
 function Tokenizer(f::IOStream, vocab_size::Int)
     id_to_token = Vector{String}(undef, vocab_size)
-    token_to_id = Dict{String, Int}()
+    token_to_id = Dict{String,Int}()
     token_scores = Vector{Float32}(undef, vocab_size)
     max_token_length = read(f, Int32)
     for i in 1:vocab_size
@@ -19,7 +19,7 @@ function Tokenizer(f::IOStream, vocab_size::Int)
         len = read(f, Int32)
         word = String(read(f, len))
         id_to_token[i] = word
-        token_to_id[word] = i
+        haskey(token_to_id, word) || (token_to_id[word] = i)
     end
     return Tokenizer(id_to_token, token_to_id, token_scores)
 end
@@ -67,7 +67,6 @@ end
     value_cache::Array{T,3}
     pos::Int
 end
-
 
 function read_transformer_weights(T, f::IOStream, c::Config)::TransformerWeights{T}
     share_weights = c.vocab_size > 0
@@ -147,12 +146,9 @@ end
         mul!(s.k, w.wk[:, :, l]', s.xb)
         mul!(s.v, w.wv[:, :, l]', s.xb)
 
-        # apply RoPE rotation to the q and k vectors for each head
         for h in 1:n_heads
-            # get the q and k vectors for this head
             q = s.q[((h-1)*head_size+1):(h*head_size)]
             k = s.k[((h-1)*head_size+1):(h*head_size)]
-            # rotate q and k by the freq_cis_real and freq_cis_imag
             for i in 1:(head_size÷2)
                 q0 = q[2*i-1]
                 q1 = q[2*i]
@@ -186,7 +182,6 @@ end
             )
         end
 
-
         mul!(s.xb2, w.wo[:, :, l]', s.xb)
         x .+= s.xb2
 
@@ -218,7 +213,7 @@ function bpe_encode(text::String, tokenizer::Tokenizer)
         best_score = -Inf32
         best_id, best_idx = -1, -1
         for i in 1:(length(tokens)-1)
-            id = get(tokenizer.token_to_id, tokenizer.id_to_token[tokens[i]]*tokenizer.id_to_token[tokens[i+1]], nothing)
+            id = get(tokenizer.token_to_id, tokenizer.id_to_token[tokens[i]] * tokenizer.id_to_token[tokens[i+1]], nothing)
             if !isnothing(id) && tokenizer.token_scores[id] > best_score
                 best_score = tokenizer.token_scores[id]
                 best_id = id
@@ -227,7 +222,7 @@ function bpe_encode(text::String, tokenizer::Tokenizer)
         end
         best_id == -1 && break
         tokens[best_idx] = best_id
-        deleteat!(tokens, best_idx+1)
+        deleteat!(tokens, best_idx + 1)
     end
     return tokens
 end
@@ -250,14 +245,7 @@ function forward(weights::TransformerWeights{T}, tokenizer::Tokenizer, config::C
     end
 end
 
-
-
-
-function main(
-    T,
-    checkpoint_filenames::AbstractString,
-    tokenizer_filename::AbstractString;
-)
+function main(T, checkpoint_filenames::AbstractString, tokenizer_filename::AbstractString;)
     config, weights, tokenizer = nothing, nothing, nothing
     open(checkpoint_filenames, "r") do file
         config = Config(file)
