@@ -1,11 +1,28 @@
-# this file contains a Julia port of https://github.com/karpathy/llama2.c
-# all credit goes to Andrej Karpathy (author of llama2.c)
-
 using LinearAlgebra
-using StatsBase
-using Printf
+using Mmap
 
-# Transformer and RunState structs, and related memory management
+using StatsBase
+
+struct Tokenizer
+    id_to_token::Vector{String}
+    token_to_id::Dict{String,Int}
+    token_scores::Vector{Float32}
+end
+
+function Tokenizer(f::IOStream, vocab_size::Int)
+    id_to_token = Vector{String}(undef, vocab_size)
+    token_to_id = Dict{String,Int}()
+    token_scores = Vector{Float32}(undef, vocab_size)
+    max_token_length = read(f, Int32)
+    for i in 1:vocab_size
+        token_scores[i] = read(f, Float32)
+        len = read(f, Int32)
+        word = String(read(f, len))
+        id_to_token[i] = word
+        haskey(token_to_id, word) || (token_to_id[word] = i)
+    end
+    return Tokenizer(id_to_token, token_to_id, token_scores)
+end
 
 struct Config
     dim::Int        # transformer dimension
@@ -13,159 +30,126 @@ struct Config
     n_layers::Int   # number of layers
     n_heads::Int    # number of query heads
     n_kv_heads::Int # number of key/value heads (can be < query heads because of multiquery)
-    vocab_size::Int # vocabulary size, usually 256 (byte-level)
+    vocab_size::Int # vocabulary size, usually 256 (byte-level) if vocab_size < 0 means to share weights
     seq_len::Int    # max sequence length
+    Config(f::IOStream) = new([read(f, Int32) for i in 1:7]...)
 end
 
-read_config(f::IOStream) = Config(
-    read(f, Int32),
-    read(f, Int32),
-    read(f, Int32),
-    read(f, Int32),
-    read(f, Int32),
-    read(f, Int32),
-    read(f, Int32),
-)
-
-@kwdef struct TransformerWeights
-    # token embedding table
-    token_embedding_table::Matrix{Float32} # (vocab_size, dim)
-    # weights for rmsnorms
-    rms_att_weight::Matrix{Float32} # (layer, dim) rmsnorm weights
-    rms_ffn_weight::Matrix{Float32} # (layer, dim)
-    # weights for matmuls
-    wq::Array{Float32,3} # (layer, dim, dim)
-    wk::Array{Float32,3} # (layer, dim, dim)
-    wv::Array{Float32,3} # (layer, dim, dim)
-    wo::Array{Float32,3} # (layer, dim, dim)
-    # weights for ffn
-    w1::Array{Float32,3} # (layer, hidden_dim, dim)
-    w2::Array{Float32,3} # (layer, dim, hidden_dim)
-    w3::Array{Float32,3} # (layer, hidden_dim, dim)
-    # final rmsnorm
-    rms_final_weight::Vector{Float32} # (dim,)
-    # freq_cis for RoPE relatively positional embeddings
+struct TransformerWeights{T<:AbstractFloat}
+    token_embedding_table::Matrix{T}
+    rms_att_weight::Matrix{T} # (layer, dim)
+    wq::Array{T,3}  # (layer, dim, dim)
+    wk::Array{T,3}
+    wv::Array{T,3}
+    wo::Array{T,3}
+    rms_ffn_weight::Matrix{T}
+    w1::Array{T,3}  # (layer, hidden_dim, dim)
+    w2::Array{T,3}  # (layer, dim, hidden_dim)
+    w3::Array{T,3}  # (layer, hidden_dim, dim)
+    rms_final_weight::Vector{T} # (dim,)
     freq_cis_real::Matrix{Float32} # (seq_len, dim/2)
     freq_cis_imag::Matrix{Float32} # (seq_len, dim/2)
+    wcls::Matrix{T}
 end
 
-TransformerWeights(p::Config) = TransformerWeights(;
-    token_embedding_table = zeros(Float32, p.dim, p.vocab_size),
-    rms_att_weight        = zeros(Float32, p.dim, p.n_layers),
-    rms_ffn_weight        = zeros(Float32, p.dim, p.n_layers),
-    wq                    = zeros(Float32, p.dim, p.dim, p.n_layers),
-    wk                    = zeros(Float32, p.dim, p.dim, p.n_layers),
-    wv                    = zeros(Float32, p.dim, p.dim, p.n_layers),
-    wo                    = zeros(Float32, p.dim, p.dim, p.n_layers),
-    w1                    = zeros(Float32, p.dim, p.hidden_dim, p.n_layers),
-    w2                    = zeros(Float32, p.hidden_dim, p.dim, p.n_layers),
-    w3                    = zeros(Float32, p.dim, p.hidden_dim, p.n_layers),
-    rms_final_weight      = zeros(Float32, p.dim),
-    freq_cis_real         = zeros(Float32, (p.dim ÷ p.n_heads) ÷ 2, p.seq_len),
-    freq_cis_imag         = zeros(Float32, (p.dim ÷ p.n_heads) ÷ 2, p.seq_len),
+@kwdef struct RunState{T<:AbstractFloat}
+    x::Vector{T}
+    xb::Vector{T}
+    xb2::Vector{T}
+    hb::Vector{T}
+    hb2::Vector{T}
+    q::Vector{T}
+    k::Vector{T}
+    v::Vector{T}
+    att::Vector{T}
+    logits::Vector{T}
+    key_cache::Array{T,3}
+    value_cache::Array{T,3}
+    pos::Int
+end
+
+function read_transformer_weights(T, f::IOStream, c::Config)::TransformerWeights{T}
+    share_weights = c.vocab_size > 0
+    vocab_size = abs(c.vocab_size)
+    token_embedding_table = mmap(f, Matrix{T}, (c.dim, vocab_size))
+    skip(f, sizeof(token_embedding_table))
+    rms_att_weight = mmap(f, Matrix{Float32}, (c.dim, c.n_layers))
+    skip(f, sizeof(rms_att_weight))
+    wq = reshape(mmap(f, Matrix{T}, (c.dim * c.dim * c.n_layers, 1)), c.dim, c.dim, c.n_layers)
+    skip(f, sizeof(wq))
+    wk = reshape(mmap(f, Matrix{T}, (c.dim * c.dim * c.n_layers, 1)), c.dim, c.dim, c.n_layers)
+    skip(f, sizeof(wk))
+    wv = reshape(mmap(f, Matrix{T}, (c.dim * c.dim * c.n_layers, 1)), c.dim, c.dim, c.n_layers)
+    skip(f, sizeof(wv))
+    wo = reshape(mmap(f, Matrix{T}, (c.dim * c.dim * c.n_layers, 1)), c.dim, c.dim, c.n_layers)
+    skip(f, sizeof(wo))
+    rms_ffn_weight = mmap(f, Matrix{T}, (c.dim, c.n_layers))
+    skip(f, sizeof(rms_ffn_weight))
+    w1 = reshape(mmap(f, Matrix{T}, (c.dim * c.hidden_dim * c.n_layers, 1)), c.dim, c.hidden_dim, c.n_layers)
+    skip(f, sizeof(w1))
+    w2 = reshape(mmap(f, Matrix{T}, (c.hidden_dim * c.dim * c.n_layers, 1)), c.hidden_dim, c.dim, c.n_layers)
+    skip(f, sizeof(w2))
+    w3 = reshape(mmap(f, Matrix{T}, (c.dim * c.hidden_dim * c.n_layers, 1)), c.dim, c.hidden_dim, c.n_layers)
+    skip(f, sizeof(w3))
+    rms_final_weight = mmap(f, Vector{T}, (c.dim,))
+    skip(f, sizeof(rms_final_weight))
+    freq_cis_real = mmap(f, Matrix{Float32}, ((c.dim ÷ c.n_heads) ÷ 2, c.seq_len))
+    skip(f, sizeof(freq_cis_real))
+    freq_cis_imag = mmap(f, Matrix{Float32}, ((c.dim ÷ c.n_heads) ÷ 2, c.seq_len))
+    skip(f, sizeof(freq_cis_imag))
+    wcls = share_weights ? token_embedding_table : mmap(f, Matrix{T}, (c.dim, vocab_size))
+    TransformerWeights{T}(token_embedding_table, rms_att_weight, wq, wk, wv, wo, rms_ffn_weight, w1, w2, w3, rms_final_weight, freq_cis_real, freq_cis_imag, wcls)
+end
+
+RunState(T, c::Config) = RunState{T}(;
+    x=zeros(T, c.dim),
+    xb=zeros(T, c.dim),
+    xb2=zeros(T, c.dim),
+    hb=zeros(T, c.hidden_dim),
+    hb2=zeros(T, c.hidden_dim),
+    q=zeros(T, c.dim),
+    k=zeros(T, c.dim),
+    v=zeros(T, c.dim),
+    att=zeros(T, c.seq_len),
+    logits=zeros(T, abs(c.vocab_size)),
+    key_cache=zeros(T, c.dim, c.seq_len, c.n_layers),
+    value_cache=zeros(T, c.dim, c.seq_len, c.n_layers),
+    pos=1
 )
 
-function checkpoint_init_weights!(w::TransformerWeights, f::IOStream)
-    read!(f, w.token_embedding_table)
-    read!(f, w.rms_att_weight)
-    read!(f, w.wq)
-    read!(f, w.wk)
-    read!(f, w.wv)
-    read!(f, w.wo)
-    read!(f, w.rms_ffn_weight)
-    read!(f, w.w1)
-    read!(f, w.w2)
-    read!(f, w.w3)
-    read!(f, w.rms_final_weight)
-    read!(f, w.freq_cis_real)
-    read!(f, w.freq_cis_imag)
-    return nothing
-end
-
-@kwdef struct RunState
-    # current wave of activations
-    x::Vector{Float32}      # activation at current time stamp (dim,)
-    xb::Vector{Float32}     # same, but inside a residual branch (dim,)
-    xb2::Vector{Float32}    # an additional buffer just for convenience (dim,)
-    hb::Vector{Float32}     # buffer for hidden dimension in the ffn (hidden_dim,)
-    hb2::Vector{Float32}    # buffer for hidden dimension in the ffn (hidden_dim,)
-    q::Vector{Float32}      # query (dim,)
-    k::Vector{Float32}      # key (dim,)
-    v::Vector{Float32}      # value (dim,)
-    att::Vector{Float32}    # buffer for scores/attention values (seq_len,)
-    logits::Vector{Float32} # output logits
-    # kv cache
-    key_cache::Array{Float32,3}   # (layer, seq_len, dim)
-    value_cache::Array{Float32,3} # (layer, seq_len, dim)
-end
-
-RunState(p::Config) = RunState(;
-    x           = zeros(Float32, p.dim),
-    xb          = zeros(Float32, p.dim),
-    xb2         = zeros(Float32, p.dim),
-    hb          = zeros(Float32, p.hidden_dim),
-    hb2         = zeros(Float32, p.hidden_dim),
-    q           = zeros(Float32, p.dim),
-    k           = zeros(Float32, p.dim),
-    v           = zeros(Float32, p.dim),
-    att         = zeros(Float32, p.seq_len),
-    logits      = zeros(Float32, p.vocab_size),
-    key_cache   = zeros(Float32, p.dim, p.seq_len, p.n_layers),
-    value_cache = zeros(Float32, p.dim, p.seq_len, p.n_layers),
-)
 
 function rmsnorm!(o, x, weight)
-    # calculate sum of squares
-    ss = dot(x, x)
-    ss /= length(x)
-    ss += 1f-5
-    ss = 1f0 / sqrt(ss)
-    # normalize and scale
+    ss = 1.0f0 / √(dot(x, x) / length(x) + 1.0f-5)
     o .= weight .* (ss .* x)
     return nothing
 end
 
 function softmax!(x)
-    # find max value (for numerical stability)
-    max_val = maximum(x)
-    # exp
-    x .= exp.(x .- max_val)
-    # normalize
+    x .= exp.(x .- maximum(x))
     x ./= sum(x)
     return nothing
 end
 
-@views function transformer!(token::Int, pos::Int, p::Config, s::RunState, w::TransformerWeights)
-    # a few convenience variables
+@views function transformer!(token::Int, pos::Int, p::Config, s::RunState, w::TransformerWeights{T}) where {T<:AbstractFloat}
     x = s.x
     dim = p.dim
     hidden_dim = p.hidden_dim
-    head_size = dim ÷ p.n_heads
+    n_heads = p.n_heads
+    head_size = dim ÷ n_heads
 
-    # copy the token embedding into x
     copyto!(x, w.token_embedding_table[:, token])
-
-    # pluck out the "pos" row of freq_cis_real and freq_cis_imag
     freq_cis_real_row = w.freq_cis_real[:, pos]
     freq_cis_imag_row = w.freq_cis_imag[:, pos]
-
-    # forward all the layers
     for l in 1:p.n_layers
-        # attention rmsnorm
         rmsnorm!(s.xb, x, w.rms_att_weight[:, l])
-
-        # qkv matmuls for this position
         mul!(s.q, w.wq[:, :, l]', s.xb)
         mul!(s.k, w.wk[:, :, l]', s.xb)
         mul!(s.v, w.wv[:, :, l]', s.xb)
 
-        # apply RoPE rotation to the q and k vectors for each head
-        for h in 1:p.n_heads
-            # get the q and k vectors for this head
-            q = s.q[((h-1) * head_size + 1):(h * head_size)]
-            k = s.k[((h-1) * head_size + 1):(h * head_size)]
-            # rotate q and k by the freq_cis_real and freq_cis_imag
-            for i in 1:(head_size ÷ 2)
+        for h in 1:n_heads
+            q = s.q[((h-1)*head_size+1):(h*head_size)]
+            k = s.k[((h-1)*head_size+1):(h*head_size)]
+            for i in 1:(head_size÷2)
                 q0 = q[2*i-1]
                 q1 = q[2*i]
                 k0 = k[2*i-1]
@@ -173,207 +157,105 @@ end
                 fcr = freq_cis_real_row[i]
                 fci = freq_cis_imag_row[i]
                 q[2*i-1] = q0 * fcr - q1 * fci
-                q[2*i]   = q0 * fci + q1 * fcr
+                q[2*i] = q0 * fci + q1 * fcr
                 k[2*i-1] = k0 * fcr - k1 * fci
-                k[2*i]   = k0 * fci + k1 * fcr
+                k[2*i] = k0 * fci + k1 * fcr
             end
         end
 
-        # save key,value at this time step (pos) to our kv cache
         copyto!(s.key_cache[:, pos, l], s.k)
         copyto!(s.value_cache[:, pos, l], s.v)
 
-        # multihead attention. iterate over all heads
-        for h in 1:p.n_heads
-            # get the query vector for this head
-            q = s.q[((h-1) * head_size + 1):(h * head_size)]
-            # iterate over all timesteps, including the current one
+        for h in 1:n_heads
+            q = s.q[((h-1)*head_size+1):(h*head_size)]
             for t in 1:pos
-                # get the key vector for this head and at this timestep
-                k = s.key_cache[((h-1) * head_size + 1):(h * head_size), t, l]
-                # calculate the attention score as the dot product of q and k
-                score = dot(q, k) / sqrt(Float32(head_size))
-                # save the score to the attention buffer
+                k = s.key_cache[((h-1)*head_size+1):(h*head_size), t, l]
+                score = dot(q, k) / sqrt(T(head_size))
                 s.att[t] = score
             end
-
-            # softmax the scores to get attention weights, from 0..pos inclusively
             softmax!(s.att[1:pos])
 
-            # weighted sum of the values, store back into xb
             mul!(
-                s.xb[((h-1) * head_size + 1):(h * head_size)],
-                s.value_cache[((h-1) * head_size + 1):(h * head_size), 1:pos, l],
+                s.xb[((h-1)*head_size+1):(h*head_size)],
+                s.value_cache[((h-1)*head_size+1):(h*head_size), 1:pos, l],
                 s.att[1:pos],
             )
         end
 
-        # final matmul to get the output of the attention
         mul!(s.xb2, w.wo[:, :, l]', s.xb)
-
-        # residual connection back into x
         x .+= s.xb2
 
-        # ffn rmsnorm
         rmsnorm!(s.xb, x, w.rms_ffn_weight[:, l])
 
-        # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        # first calculate self.w1(x) and self.w3(x)
         mul!(s.hb, w.w1[:, :, l]', s.xb)
         mul!(s.hb2, w.w3[:, :, l]', s.xb)
-
-        # F.silu silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
-        for i in 1:hidden_dim
-            s.hb[i] = s.hb[i] * (1f0 / (1f0 + exp(-s.hb[i])))
+        @simd for i in 1:hidden_dim
+            s.hb[i] = s.hb[i] * (1.0f0 / (1.0f0 + exp(-s.hb[i])))
         end
-
         s.hb .*= s.hb2
-
-        # final matmul to get the output of the ffn
         mul!(s.xb, w.w2[:, :, l]', s.hb)
 
-        # residual connection
         x .+= s.xb
     end
 
-    # final rmsnorm
     rmsnorm!(x, x, w.rms_final_weight)
-
-    # classifier into logits
-    mul!(s.logits, w.token_embedding_table', x)
-
-    return nothing
+    mul!(s.logits, w.wcls', x)
 end
 
-function str_lookup(str::Vector{UInt8}, vocab::Vector{Vector{UInt8}}, vocab_size::Int)::Int
-    for i in 1:vocab_size
-        if str == vocab[i]
-            return i
-        end
-    end
-    return -1
-end
-
-function bpe_encode(text::String, vocab::Vector{Vector{UInt8}}, vocab_scores::Vector{Float32}, vocab_size::Int, tokens::Vector{Int})
-    n_tokens = 0
+function bpe_encode(text::String, tokenizer::Tokenizer)
+    tokens = Int[]
     for c in text
-        str_buffer = Vector{UInt8}(string(c))
-        id = str_lookup(str_buffer, vocab, vocab_size)
-        if id == -1
-            println("not good")
-            exit(1)
-        end
-        n_tokens += 1
-        tokens[n_tokens] = id
+        id = get(tokenizer.token_to_id, string(c), nothing)
+        isnothing(id) && (println("character $c not in vocab"); exit(1))
+        push!(tokens, id)
     end
-
     while true
-        best_score = -1e10
-        best_id = -1
-        best_idx = -1
-
-        for i in 1:n_tokens-1
-            # check if we can merge the pair (tokens[i], tokens[i+1])
-            str_buffer = [vocab[tokens[i]]; vocab[tokens[i+1]]]
-            id = str_lookup(str_buffer, vocab, vocab_size)
-            if id != -1 && vocab_scores[id] > best_score
-                best_score = vocab_scores[id]
+        best_score = -Inf32
+        best_id, best_idx = -1, -1
+        for i in 1:(length(tokens)-1)
+            id = get(tokenizer.token_to_id, tokenizer.id_to_token[tokens[i]] * tokenizer.id_to_token[tokens[i+1]], nothing)
+            if !isnothing(id) && tokenizer.token_scores[id] > best_score
+                best_score = tokenizer.token_scores[id]
                 best_id = id
                 best_idx = i
             end
         end
-
-        best_idx == -1 && break # we couldn't find any more pairs to merge, so we're done
-
-        # merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        best_id == -1 && break
         tokens[best_idx] = best_id
-        # delete token at position best_idx+1, shift the entire sequence back 1
-        for i in best_idx+1:n_tokens-1
-            tokens[i] = tokens[i+1]
-        end
-        n_tokens -= 1
+        deleteat!(tokens, best_idx + 1)
     end
-
-    return n_tokens
+    return tokens
 end
 
-function main(
-        checkpoint_filename::AbstractString,
-        tokenizer_filename::AbstractString;
-        temperature::Float32 = 0.9f0,
-        prompt::AbstractString = "",
-    )
-
-    config = nothing
-    weights = nothing
-
-    # read in the model.bin file
-    open(checkpoint_filename) do file
-        config = read_config(file)
-        weights = TransformerWeights(config)
-        checkpoint_init_weights!(weights, file)
-    end
-
-    # read in the tokenizer.bin file
-    vocab = Vector{Vector{UInt8}}(undef, config.vocab_size)
-    vocab_scores = Vector{Float32}(undef, config.vocab_size)
-    max_token_length = 1
-
-    open(tokenizer_filename) do file
-        max_token_length = read(file, Int32)
-        for i in 1:config.vocab_size
-            vocab_scores[i] = read(file, Float32)
-            len = read(file, Int32)
-            vocab[i] = read(file, len)
-        end
-    end
-
-    # create and init the application RunState
-    state = RunState(config)
-
-    prompt_tokens = zeros(Int, config.seq_len)
-    num_prompt_tokens = 0
-    if length(prompt) != 0
-        num_prompt_tokens = bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, prompt_tokens)
-    end
-
-    # the current position we are in
-    time_start = time_ns()
-
-    token = 1 # 1 = BOS token in Llama-2 sentencepiece
-
-    for pos in 1:config.seq_len
-        # forward the transformer to get logits for the next token
-        transformer!(token, pos, config, state, weights)
-
-        # sample the next token
-        if pos <= num_prompt_tokens
-            next = prompt_tokens[pos]
-        else
-            # sample the next token
-            if temperature == 0.0f0
-                # greedy argmax sampling
-                next = argmax(state.logits)
-            else
-                # apply the temperature to the logits
-                state.logits ./= temperature
-                # apply softmax to the logits to get the probabilities for next token
-                softmax!(state.logits)
-                # we now want to sample from this distribution to get the next token
-                next = wsample(1:config.vocab_size, state.logits)
-            end
-        end
-
-        print(String(copy(vocab[next])))
-
-        # advance forward
+function forward(weights::TransformerWeights{T}, tokenizer::Tokenizer, config::Config, prompt::String, temperature::Float32, steps::Int) where {T<:AbstractFloat}
+    state = RunState(T, config)
+    prompt_tokens = bpe_encode(prompt, tokenizer)
+    token = 2 # beginning of sentence token id, 1 is <unk>
+    next = 2
+    for pos in 1:min(steps, config.seq_len)
+        print(tokenizer.id_to_token[next])
         token = next
+        next == 3 && pos == steps && break # end of sequence
+        transformer!(token, pos, config, state, weights)
+        pos <= length(prompt_tokens) && (next = prompt_tokens[pos]; continue)
+        temperature == 0.0f0 && (next = argmax(state.logits); continue)
+        state.logits ./= temperature
+        softmax!(state.logits)
+        next = wsample(1:abs(config.vocab_size), state.logits)
     end
-    print('\n')
-
-    # report our achieved tok/s
-    time_end = time_ns()
-    @printf "achieved tok/s: %f\n" config.seq_len / (time_end - time_start)*1e9
-
-    return nothing
 end
+
+function main(T, checkpoint_filenames::AbstractString, tokenizer_filename::AbstractString;)
+    config, weights, tokenizer = nothing, nothing, nothing
+    open(checkpoint_filenames, "r") do file
+        config = Config(file)
+        weights = read_transformer_weights(T, file, config)
+    end
+    open(tokenizer_filename, "r") do file
+        tokenizer = Tokenizer(file, abs(config.vocab_size))
+    end
+    @show config
+    forward(weights, tokenizer, config, "I want to", 0.0f0, 256)
+end
+
+main(Float32, "llama2_7b.bin", "tokenizer.bin")
