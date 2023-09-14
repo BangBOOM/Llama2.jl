@@ -156,7 +156,6 @@ end
                 mul!(s.v, w.wv[:, :, l]', s.xb)
             end
 
-
             @timeit to "RoPE" for h in 1:n_heads
                 q = s.q[((h-1)*head_size+1):(h*head_size)]
                 k = s.k[((h-1)*head_size+1):(h*head_size)]
