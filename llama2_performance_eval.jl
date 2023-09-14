@@ -1,3 +1,4 @@
+using TimerOutputs
 using LinearAlgebra
 using Mmap
 
@@ -5,6 +6,8 @@ using StatsBase
 
 @show BLAS.get_num_threads()
 const UNK, BOS, EOS = 1:3
+
+const to = TimerOutput()
 
 struct Tokenizer
     id_to_token::Vector{String}
@@ -144,61 +147,68 @@ end
     freq_cis_real_row = w.freq_cis_real[:, pos]
     freq_cis_imag_row = w.freq_cis_imag[:, pos]
     for l in 1:p.n_layers
-        rmsnorm!(s.xb, x, w.rms_att_weight[:, l])
-        mul!(s.q, w.wq[:, :, l]', s.xb)
-        mul!(s.k, w.wk[:, :, l]', s.xb)
-        mul!(s.v, w.wv[:, :, l]', s.xb)
+        @timeit to "layer" begin
+            rmsnorm!(s.xb, x, w.rms_att_weight[:, l])
 
-        for h in 1:n_heads
-            q = s.q[((h-1)*head_size+1):(h*head_size)]
-            k = s.k[((h-1)*head_size+1):(h*head_size)]
-            for i in 1:(head_size÷2)
-                q0 = q[2*i-1]
-                q1 = q[2*i]
-                k0 = k[2*i-1]
-                k1 = k[2*i]
-                fcr = freq_cis_real_row[i]
-                fci = freq_cis_imag_row[i]
-                q[2*i-1] = q0 * fcr - q1 * fci
-                q[2*i] = q0 * fci + q1 * fcr
-                k[2*i-1] = k0 * fcr - k1 * fci
-                k[2*i] = k0 * fci + k1 * fcr
+            @timeit to "QKV" begin
+                mul!(s.q, w.wq[:, :, l]', s.xb)
+                mul!(s.k, w.wk[:, :, l]', s.xb)
+                mul!(s.v, w.wv[:, :, l]', s.xb)
             end
-        end
 
-        copyto!(s.key_cache[:, pos, l], s.k)
-        copyto!(s.value_cache[:, pos, l], s.v)
 
-        for h in 1:n_heads
-            q = s.q[((h-1)*head_size+1):(h*head_size)]
-            for t in 1:pos
-                k = s.key_cache[((h-1)*head_size+1):(h*head_size), t, l]
-                score = dot(q, k) / sqrt(T(head_size))
-                s.att[t] = score
+            @timeit to "RoPE" for h in 1:n_heads
+                q = s.q[((h-1)*head_size+1):(h*head_size)]
+                k = s.k[((h-1)*head_size+1):(h*head_size)]
+                for i in 1:(head_size÷2)
+                    q0 = q[2*i-1]
+                    q1 = q[2*i]
+                    k0 = k[2*i-1]
+                    k1 = k[2*i]
+                    fcr = freq_cis_real_row[i]
+                    fci = freq_cis_imag_row[i]
+                    q[2*i-1] = q0 * fcr - q1 * fci
+                    q[2*i] = q0 * fci + q1 * fcr
+                    k[2*i-1] = k0 * fcr - k1 * fci
+                    k[2*i] = k0 * fci + k1 * fcr
+                end
             end
-            softmax!(s.att[1:pos])
 
-            mul!(
-                s.xb[((h-1)*head_size+1):(h*head_size)],
-                s.value_cache[((h-1)*head_size+1):(h*head_size), 1:pos, l],
-                s.att[1:pos],
-            )
+            copyto!(s.key_cache[:, pos, l], s.k)
+            copyto!(s.value_cache[:, pos, l], s.v)
+
+            @timeit to "Attention" for h in 1:n_heads
+                q = s.q[((h-1)*head_size+1):(h*head_size)]
+                for t in 1:pos
+                    k = s.key_cache[((h-1)*head_size+1):(h*head_size), t, l]
+                    score = dot(q, k) / sqrt(T(head_size))
+                    s.att[t] = score
+                end
+                softmax!(s.att[1:pos])
+
+                mul!(
+                    s.xb[((h-1)*head_size+1):(h*head_size)],
+                    s.value_cache[((h-1)*head_size+1):(h*head_size), 1:pos, l],
+                    s.att[1:pos],
+                )
+            end
+
+            @timeit to "AttOut" mul!(s.xb2, w.wo[:, :, l]', s.xb)
+            x .+= s.xb2
+
+            rmsnorm!(s.xb, x, w.rms_ffn_weight[:, l])
+
+            @timeit to "FeedForward" begin
+                mul!(s.hb, w.w1[:, :, l]', s.xb)
+                mul!(s.hb2, w.w3[:, :, l]', s.xb)
+                @simd for i in 1:hidden_dim
+                    s.hb[i] = s.hb[i] * (1.0f0 / (1.0f0 + exp(-s.hb[i])))
+                end
+                s.hb .*= s.hb2
+                mul!(s.xb, w.w2[:, :, l]', s.hb)
+            end
+            x .+= s.xb
         end
-
-        mul!(s.xb2, w.wo[:, :, l]', s.xb)
-        x .+= s.xb2
-
-        rmsnorm!(s.xb, x, w.rms_ffn_weight[:, l])
-
-        mul!(s.hb, w.w1[:, :, l]', s.xb)
-        mul!(s.hb2, w.w3[:, :, l]', s.xb)
-        @simd for i in 1:hidden_dim
-            s.hb[i] = s.hb[i] * (1.0f0 / (1.0f0 + exp(-s.hb[i])))
-        end
-        s.hb .*= s.hb2
-        mul!(s.xb, w.w2[:, :, l]', s.hb)
-
-        x .+= s.xb
     end
 
     rmsnorm!(x, x, w.rms_final_weight)
@@ -238,7 +248,7 @@ function forward(weights::TransformerWeights{T}, tokenizer::Tokenizer, config::C
         (pos > 1 && (next == EOS || next == BOS)) && break
         pos > 1 && print(tokenizer.id_to_token[next])
         token = next
-        transformer!(token, pos, config, state, weights)
+        @timeit to "transformer" transformer!(token, pos, config, state, weights)
         pos <= length(prompt_tokens) && (next = prompt_tokens[pos]; continue)
         temperature == 0.0f0 && (next = argmax(state.logits); continue)
         state.logits ./= temperature
@@ -249,7 +259,7 @@ end
 
 function main(T, checkpoint_filenames::AbstractString, tokenizer_filename::AbstractString; prompt="I want to", temperature=0.8f0, steps=256)
     config, weights, tokenizer = nothing, nothing, nothing
-    open(checkpoint_filenames, "r") do file
+    @timeit to "load checkpoint" open(checkpoint_filenames, "r") do file
         config = Config(file)
         weights = read_transformer_weights(T, file, config)
     end
@@ -266,3 +276,6 @@ main(
     temperature=length(ARGS) > 3 ? parse(Float32, ARGS[4]) : 0.8f0,
     steps=length(ARGS) > 4 ? parse(Int, ARGS[5]) : 256
 )
+
+println()
+show(to)
