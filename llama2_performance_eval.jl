@@ -267,10 +267,10 @@ function main(T, checkpoint_filenames::AbstractString, tokenizer_filename::Abstr
         tokenizer = Tokenizer(file, abs(config.vocab_size))
     end
     @show config
-    forward(weights, tokenizer, config, prompt, temperature, steps)
+    @timeit to "forward" forward(weights, tokenizer, config, prompt, temperature, steps)
 end
 
-main(
+@timeit to "main" main(
     Float32, ARGS[1], ARGS[2];
     prompt=length(ARGS) > 2 ? ARGS[3] : "I want to",
     temperature=length(ARGS) > 3 ? parse(Float32, ARGS[4]) : 0.8f0,
