@@ -9,7 +9,6 @@ struct Tokenizer
     id_to_token::Vector{String}
     token_to_id::Dict{String,Int}
     token_scores::Vector{Float32}
-    byte_pieces::Vector{Char}
 end
 
 function Tokenizer(f::IOStream, vocab_size::Int)
@@ -20,16 +19,11 @@ function Tokenizer(f::IOStream, vocab_size::Int)
     for i in 1:vocab_size
         token_scores[i] = read(f, Float32)
         len = read(f, Int32)
-        word = String(read(f, len)) * '\0'
+        word = String(read(f, len))
         id_to_token[i] = word
         haskey(token_to_id, word) || (token_to_id[word] = i)
     end
-    byte_pieces = Vector{Char}(undef, 512)
-    for i in 0:255
-        byte_pieces[i*2+1] = Char(i)
-        byte_pieces[i*2+2] = '\0'
-    end
-    return Tokenizer(id_to_token, token_to_id, token_scores, byte_pieces)
+    return Tokenizer(id_to_token, token_to_id, token_scores)
 end
 
 struct Config
@@ -213,7 +207,7 @@ end
 function bpe_encode(text::String, tokenizer::Tokenizer)
     tokens = Int[]
     for c in text
-        id = get(tokenizer.token_to_id, string(c) * '\0', nothing)
+        id = get(tokenizer.token_to_id, string(c), nothing)
         isnothing(id) && (println("character $c not in vocab"); exit(1))
         push!(tokens, id)
     end
@@ -235,23 +229,13 @@ function bpe_encode(text::String, tokenizer::Tokenizer)
     return tokens
 end
 
-function bpe_decode(tokenizer::Tokenizer, pre_token::Int, token::Int)
-    piece = tokenizer.id_to_token[token]
-    (pre_token == 1 && piece[1] == ' ') && (piece = piece[2:end])
-    byte_val = nothing
-    m = match(r"0x([0-9A-Fa-f]{2})", piece)
-    !isnothing(m) && (byte_val = tryparse(UInt8, m[1], base=16))
-    !isnothing(byte_val) && (piece = tokenizer.byte_pieces[byte_val*2+1])
-    return piece
-end
-
 function forward(weights::TransformerWeights{T}, tokenizer::Tokenizer, config::Config, prompt::String, temperature::Float32, steps::Int) where {T<:AbstractFloat}
     state = RunState(T, config)
     prompt_tokens = bpe_encode(prompt, tokenizer)
     token, next = BOS, BOS
     for pos in 1:min(steps, config.seq_len)
         (pos > 1 && (next == EOS || next==BOS)) && break
-        pos > 1 && print(bpe_decode(tokenizer, token, next))
+        pos > 1 && print(tokenizer.id_to_token[next])
         token = next
         transformer!(token, pos, config, state, weights)
         pos <= length(prompt_tokens) && (next = prompt_tokens[pos]; continue)
